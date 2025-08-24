@@ -1,0 +1,143 @@
+from pymongo import MongoClient
+import pandas as pd
+from sqlalchemy import create_engine
+from datetime import datetime, timedelta, timezone
+import re
+import os
+from bisect import bisect_left
+import pytz
+import polars as pl
+from flatten_json import flatten
+
+# Set working directory
+os.chdir(r'C:\Users\Nivedidha.Kumaravelu\OneDrive - UKBIC LTD\Documents')
+
+# Connect to MongoDB - Connection details removed for security
+client = MongoClient(
+    "mongodb://readuser:Zci5G%23%25b200Q@10.100.80.24:27017/"
+    "?retryWrites=true&serverSelectionTimeoutMS=5000&connectTimeoutMS=10000"
+    "&authSource=admin&authMechanism=SCRAM-SHA-256"
+)
+
+# Load Commissioning Tracker
+CommissioningTracker = (
+    "C:/Users/Nivedidha.Kumaravelu/UKBIC LTD/Operations Department Site - "
+    "Released Commissioning Material/Commissioning Product Tracker NEW.xlsx"
+)
+
+xl = pl.read_excel(
+    CommissioningTracker,
+    sheet_name='Product Tracker Power BI',
+    has_header=True,
+    read_options={"header_row": 2}
+)
+
+xl_mix = xl.filter(
+    xl["Part Number"].str.contains("SLUR", literal=True).fill_null(False)
+    | xl["Functional Description of Part"].str.contains("Slur", literal=True).fill_null(False)
+)
+
+# Check MongoDB connection
+for db_name in client.list_databases():
+    print(db_name)
+
+db = client['TRACE']
+
+# pNID mapping
+collection = db['ProcessData']
+mapping = {
+    1: "Main Rotor Speed (m/s)",
+    2: "Main Vessel Power (kW)",
+    3: "Main Vessel Torque (nM)",
+    4: "Main Vessel Current (A)",
+    5: "Pan Speed (m/s)",
+    6: "Main Rotor Power (kW)",
+    7: "Main Rotor Torque (nM)",
+    8: "Main Rotor Current (A)",
+    9: "Main Vessel Slurry Temp (C)",
+    10: "Chilled Water Feed Temp (C)",
+    11: "Chilled Water Return Temp (C)",
+    12: "Nitrogen Flow Rate l/min",
+    13: "Viscosity",
+    14: "Transfer Vessel Supply Vacuum (mB)",
+    15: "Slurry Feedrate Mixer to Vessel (Kg/min)",
+    16: "Transfer Vessel Slurry Temp (C)",
+    17: "Degas pump output Vacuum",
+    18: "Water NMP Temp (C)",
+    19: "Step Number"
+}
+
+mapping_str_keys = {str(k): v for k, v in mapping.items()}
+
+# Define date range for August 13, 2025
+start_date = datetime(2025, 8, 13, 0, 0, 0)
+end_date = datetime(2025, 8, 14, 0, 0, 0)
+
+# Query ProcessData directly for workplaceId 578352 (Anode + Cathode Mixing) and August 13, 2025
+pipeline = [
+    {
+        '$match': {
+            "workplaceId": 578352,
+            "tsMin": {
+                '$gte': start_date,
+                '$lt': end_date
+            }
+        }
+    },
+    {'$unwind': '$values'},
+    {
+        '$project': {
+            'pNID': 1,
+            'tsMin': 1,
+            'values': 1,
+            'workplaceId': 1,
+            '_id': 0
+        }
+    }
+]
+
+result = list(collection.aggregate(pipeline))
+
+if not result:
+    print("No process data documents returned for August 13, 2025; exiting")
+    exit()
+
+# Flatten results
+dic_flat = [flatten(d) for d in result]
+for dct in dic_flat:
+    if "values_pOV" in dct and dct["values_pOV"] is not None:
+        dct["values_pOV"] = float(str(dct["values_pOV"]))
+    if "values_pV" in dct and dct["values_pV"] is not None:
+        dct["values_pV"] = float(str(dct["values_pV"]))
+
+df_pd = pl.DataFrame(dic_flat)
+
+# pNID mapping
+if "pNID" in df_pd.columns:
+    unmapped = set(df_pd["pNID"].cast(str).unique().to_list()) - set(mapping_str_keys.keys())
+    if unmapped:
+        print(f"WARNING: Unmapped pNIDs: {unmapped}")
+    df_pd = df_pd.with_columns(pl.col("pNID").cast(str).replace(mapping_str_keys))
+else:
+    print("No 'pNID' column; skipping mapping")
+
+# Ensure timestamps
+if "values_ts" not in df_pd.columns:
+    print("No 'values_ts' column; exiting")
+    exit()
+
+df_pd = df_pd.with_columns(pl.from_epoch(pl.col("values_ts"), time_unit="ms"))
+
+# Filter for August 13, 2025 only (in case any data slipped through)
+df_pd = df_pd.filter(
+    (pl.col("values_ts") >= start_date) & 
+    (pl.col("values_ts") < end_date)
+)
+
+# Add Mix_ID from tracker
+df_pd = df_pd.with_columns(pl.lit('ProcessData_Mix').alias("Mix_ID"))
+
+# Save process data results
+output_filename = f'process_data_2025_08_13.csv'
+df_pd.write_csv(output_filename)
+print(f"Saved {output_filename}")
