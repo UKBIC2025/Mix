@@ -1,0 +1,270 @@
+from pymongo import MongoClient
+import pandas as pd
+from sqlalchemy import create_engine
+from datetime import datetime, timedelta, timezone
+import re
+import os
+from bisect import bisect_left
+import pytz
+import polars as pl
+ 
+os.chdir(r'C:\Users\Nivedidha.Kumaravelu\OneDrive - UKBIC LTD\Documents') # working directory
+ 
+ 
+#connect to Mongo Client
+client = MongoClient("mongodb://readuser:Zci5G%23%25b200Q@10.100.80.24:27017/?retryWrites=true&serverSelectionTimeoutMS=5000&connectTimeoutMS=10000&authSource=admin&authMechanism=SCRAM-SHA-256")
+ 
+ 
+ 
+#load in the Comissioning Tracker
+CommissioningTracker = "C:/Users/Nivedidha.Kumaravelu/UKBIC LTD/Operations Department Site - Released Commissioning Material/Commissioning Product Tracker NEW.xlsx"
+ 
+xl = pl.read_excel(CommissioningTracker, sheet_name='Product Tracker Power BI', has_header=True, read_options={"header_row": 2})
+ 
+xl_mix = xl.filter(
+    xl["Part Number"].str.contains("SLUR", literal=True).fill_null(False) |
+    xl["Functional Description of Part"].str.contains("Slur", literal=True).fill_null(False)
+)
+ 
+# Check you're actually connected to the Mongo DB
+for db_name in client.list_databases():
+    print(db_name)
+db = client['TRACE']
+ 
+#Connect to the Trace Database
+collection = db['TraceData']
+print(db)
+ 
+ 
+###### Construct Query - use the PRODFORCAM Signals to look at workplace IDs
+query = {
+    "workplaceId": {"$in": [578352, 578351]}, #Anode + Cathode Mixing
+    "params.19.pVO": 1
+#    "operationContext.materialNumber": {"$ne": "NA"}
+}
+ 
+project = {
+    "operationContext.materialNumber": 1,
+    "workplaceId": 1,
+    "params": 1
+}
+ 
+ 
+#execute the query
+data = collection.find(query)
+query_result = list(collection.find(query, projection= project).sort("created" , -1))
+ 
+#normalise query
+df = pd.json_normalize(query_result)
+ 
+#"Flatten" query to tabular format
+from flatten_json import flatten
+dic_flattened = [flatten(d) for d in query_result]
+ 
+for d in dic_flattened:
+    d["params_17_pVO"] = float(str(d["params_17_pVO"]))
+    d["params_10_pVO"] = float(str(d["params_10_pVO"]))
+    d["params_11_pVO"] = float(str(d["params_11_pVO"]))
+    d["params_12_pVO"] = float(str(d["params_12_pVO"]))
+    d["params_13_pVO"] = float(str(d["params_13_pVO"]))
+    d["params_14_pVO"] = float(str(d["params_14_pVO"]))
+    d["params_15_pVO"] = float(str(d["params_15_pVO"]))
+    d["params_16_pVO"] = float(str(d["params_16_pVO"]))
+    d["params_18_pVO"] = str(d["params_18_pVO"])
+   
+     
+   
+df = pl.DataFrame(dic_flattened)
+ 
+#
+new_row = pd.DataFrame({'workplaceId'})
+#
+ 
+ 
+###########################
+####Get the Process Data##
+###########################
+ 
+#Connect to ProcessData Database
+collection = db['ProcessData']
+ 
+# Create Mapping for Process data (see ProdForcamSignals)
+mapping = {1: "Main Rotor Speed (m/s)",
+           2: "Main Vessel Power (kW)",
+           3: "Main Vessel Torque (nM)",
+           4: "Main Vessel Current (A)",
+           5: "Pan Speed (m/s)",
+           6: "Main Rotor Power (kW)",
+           7: "Main Rotor Torque (nM)",
+           8: "Main Rotor Current (A)",
+           9: "Main Vessel Slurry Temp (C)",
+           10:"Chilled Water Feed Temp (C)",
+           11:"Chilled Water Return Temp (C)",
+           12:"Nitrogen Flow Rate l/min",
+           13:"Viscosity",
+           14:"Transfer Vessel Supply Vacuum (mB)",
+           15:"Slurry Feedrate Mixer to Vessel (Kg/min)",
+           16:"Transfer Vessel Slurry Temp (C)",
+           17:"Degas pump output Vacuum",
+           18: "Water NMP Temp (C)",
+           19: "Step Number"}
+ 
+ 
+# Create empty container for mixing data
+full_mixing_data = pl.DataFrame()
+ 
+ 
+###################### Add in the missing mix rows manually - designate start and end times
+# newrow = df[100,:]
+ 
+# newrow['params_1_pVO'] = datetime.strptime("2024-10-14 07:26:47", "%Y-%m-%d %H:%M:%S")
+# newrow['params_2_pVO'] = datetime.strptime("2024-10-14 11:48:46", "%Y-%m-%d %H:%M:%S")
+ 
+# df.iloc[100,:] = newrow
+ 
+# newrow2 = df.iloc[101,:]
+ 
+# newrow2['params_1_pVO'] = datetime.strptime("2024-10-27 07:06:11", "%Y-%m-%d %H:%M:%S")
+# newrow2['params_2_pVO'] = datetime.strptime("2024-10-27 11:08:16", "%Y-%m-%d %H:%M:%S")
+ 
+# df.iloc[101,:] = newrow2
+ 
+ 
+######################
+ 
+df = df.filter(df["params_17_pVO"].cast(pl.Float64) > 140)
+ 
+ 
+ 
+ 
+for i in range(len(df)):
+   
+ start_time = df['params_1_pVO'][i]
+ 
+ #start_time = df['params_1_pVO'][i].tz_localize('UTC').tz_convert(pytz.timezone('Europe/London')).to_pydatetime().replace(tzinfo=None)
+ 
+ #end_time = df['params_2_pVO'][i].tz_localize('UTC').tz_convert(pytz.timezone('Europe/London')).to_pydatetime().replace(tzinfo=None)
+ 
+ end_time = df['params_2_pVO'][i]
+ 
+ workplaceId = df['workplaceId'][i]
+ 
+ 
+ #define the pipeline to use for MongoDB query
+ pipeline = [
+    {
+        '$match': {
+            "workplaceId": int(workplaceId),
+            'tsMin': {
+                '$gte': start_time + timedelta(hours=0),
+                '$lte': end_time + timedelta(hours=1)
+            }
+        }
+    },
+    {
+        '$unwind': '$values'
+    },
+    {
+        '$project': {
+            'pNID': 1,
+            'tsMin': 1,
+            'values': 1,
+            'workplaceId': 1,
+            '_id': 0  # Exclude the _id field if you don't need it
+        }
+    }
+ ]
+ 
+ 
+ 
+# Execute the aggregation query and flattern
+ result = collection.aggregate(pipeline)
+ dic_flattened = [flatten(d) for d in result]
+ 
+ for d in dic_flattened:
+  d["values_pOV"] = float(str(d["values_pOV"]))
+  d["values_pV"] = float(str(d["values_pV"]))
+ 
+ 
+ df_pd = pl.DataFrame(dic_flattened)
+ 
+ 
+ 
+# Rename the column values based on previously designated mapping
+if df_pd.height > 0 and "pNID" in df_pd.columns:
+    df_pd = df_pd.with_columns(
+        pl.col("pNID").cast(str).replace(mapping)
+    )
+ 
+ 
+ #bring in other useful trace data
+df_pd = df_pd.with_columns(pl.from_epoch(pl.col("values_ts"), time_unit="ms"))
+ 
+df_pd = df_pd.with_columns([pl.lit(df["operationContext_materialNumber"][i]).alias("Slurry"),
+                             pl.lit(df["params_3_pVO"][i]).alias("Active_ID"),
+                             pl.lit(df["params_4_pVO"][i]).alias("Binder_ID"),
+                              pl.lit(df["params_5_pVO"][i]).alias("Conductive_ID"),
+                              pl.lit(df["params_6_pVO"][i]).alias("Additive_ID"),
+                              # pl.lit(df["params_7_pVO"][i]).alias("Water_ID"),  # Uncomment if needed
+                              pl.lit(df["params_8_pVO"][i]).alias("Liquid_Binder_ID"),
+                              pl.lit(df["params_10_pVO"][i]).alias("Active_weight"),
+                              pl.lit(df["params_11_pVO"][i]).alias("Binder_weight"),
+                              pl.lit(df["params_12_pVO"][i]).alias("Conductive_weight"),
+                              pl.lit(df["params_13_pVO"][i]).alias("Additive_weight"),
+                              pl.lit(df["params_14_pVO"][i]).alias("Solvent_weight"),
+                              pl.lit(df["params_15_pVO"][i]).alias("Liquid_Binder_weight"),
+                              pl.lit(df["params_17_pVO"][i]).alias("Mix_weight"),
+                              pl.lit(str(df["params_18_pVO"][i])).alias("MES Lot Number"),
+                          ])
+                             
+                             
+                           
+ # if the MES lot number is in the comissioning tracker, use Name field - otherwise assign NA
+ 
+ 
+     
+mes_lot_number = df_pd['MES Lot Number'][0]
+     
+     # Check if the MES Lot Number exists in xl_mix
+if xl_mix.filter(pl.col('LN/ MES LOT Number') == mes_lot_number).shape[0] > 0:
+   
+    df_pd = df_pd.with_columns(pl.lit(xl_mix.filter(pl.col('LN/ MES LOT Number') == mes_lot_number)['Mix ID 1 # '][0]).alias("Mix_ID"))
+   
+else:
+    df_pd = df_pd.with_columns(pl.lit('NA' + str(i)).alias("Mix_ID"))
+     
+     
+ ### this section will assign step numbers based on Time to all of the data
+list_of_steps = df_pd.filter(pl.col('pNID') == 'Step Number')
+ 
+ 
+step_times = list(reversed(list_of_steps['values_ts']))
+step_values = list(reversed(list_of_steps['values_pOV']))
+ 
+step_times = step_times[:-1]
+step_values = step_values[:-1]
+ 
+if(len(step_values) > 0):
+   
+   df_pd = df_pd.with_columns(
+    df_pd["values_ts"].map_elements(lambda x: step_values[max(0, bisect_left(step_times, x) - 1)]).alias("step")
+)
+else:
+     df_pd = df_pd.with_columns(pl.lit(float(0)).alias("step"))
+ 
+ #Concatenate the processed data into single dataframe
+full_mixing_data = pl.concat([full_mixing_data, df_pd])
+ 
+ 
+ 
+ 
+ 
+print(i)
+ 
+ 
+#full_mixing_data['Mix_ID'] = full_mixing_data['Mix_ID'].str.replace(r'-(\d{2})$', r'-0\1')
+#full_mixing_data['Mix_ID'] = full_mixing_data['Mix_ID'].str.replace(r'1\.0', '1')
+ 
+ 
+ 
+full_mixing_data.write_csv('AmixingAuto.csv')
